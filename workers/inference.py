@@ -45,6 +45,7 @@ app = modal.App(APP_NAME)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .add_local_python_source("workers")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
     .pip_install(
         "numpy",
