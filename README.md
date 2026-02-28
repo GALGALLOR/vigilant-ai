@@ -45,6 +45,11 @@ modal setup
 modal run workers/inference.py::run_pipeline --input-video /path/to/video.mp4
 ```
 
+## Warm model cache (optional)
+```bash
+modal run workers/inference.py::download_models
+```
+
 ## Run API
 ```bash
 uvicorn api.server:app --reload --port 8000

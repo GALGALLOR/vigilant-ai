@@ -374,13 +374,26 @@ def _write_results(events: List[Dict[str, Any]]) -> None:
 
 
 def _index_events_actian(events: List[Dict[str, Any]]) -> int:
-    try:
-        from backend.services.vectordb import ensure_collection, insert_events
+    # Optional integration placeholder.
+    # Kept as no-op to avoid hard dependency on local backend services.
+    _ = events
+    return 0
 
-        ensure_collection()
-        return int(insert_events(events))
-    except Exception:
-        return 0
+
+@app.function(image=image, volumes={MODEL_DIR: weights_volume})
+def download_models() -> Dict[str, str]:
+    """Warm model cache in the `vigilant-model-weights` Modal Volume."""
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(repo_id=CLIP_MODEL, local_dir=MODEL_DIR, ignore_patterns=["*.bin"])
+    snapshot_download(repo_id=CAPTION_MODEL, local_dir=MODEL_DIR, ignore_patterns=["*.bin"])
+    return {
+        "status": "ok",
+        "cache_dir": MODEL_DIR,
+        "clip_model": CLIP_MODEL,
+        "caption_model": CAPTION_MODEL,
+        "yolo_weights": YOLO_WEIGHTS_PATH,
+    }
 
 
 @app.local_entrypoint()
@@ -390,8 +403,8 @@ def run_pipeline(input_video: str):
         raise FileNotFoundError(input_video)
 
     remote_path = f"inputs/{source.name}"
-    with source.open("rb") as f:
-        videos_volume.batch_upload(force=True).put_file(f, remote_path)
+    with videos_volume.batch_upload(force=True) as batch:
+        batch.put_file(str(source), remote_path)
 
     duration = _load_video_duration_seconds(source)
     chunks = make_video_chunks(duration, CHUNK_SECONDS)
