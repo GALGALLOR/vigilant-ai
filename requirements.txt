@@ -1,0 +1,9 @@
+modal
+fastapi
+uvicorn[standard]
+python-multipart
+pytest
+numpy
+opencv-python-headless
+pillow
+pydantic
