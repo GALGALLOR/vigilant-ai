@@ -50,6 +50,26 @@ modal run workers/inference.py::run_pipeline --input-video /path/to/video.mp4
 modal run workers/inference.py::download_models
 ```
 
+## Find likely risk scenes from results
+Use the helper script to extract likely scenes from `results/events.json` by scenario.
+
+```bash
+# Shoplifting/theft focused scenes
+python scripts/find_scenes.py --scenario shoplifting --min-score 0.45 --stages B,C
+
+# Anti-theft (broad)
+python scripts/find_scenes.py --scenario antitheft --min-score 0.40 --stages A,B,C
+
+# Human safety scenes
+python scripts/find_scenes.py --scenario human --min-score 0.45 --stages B,C
+
+# Dog safety scenes
+python scripts/find_scenes.py --scenario dog --min-score 0.45 --stages B,C
+
+# JSON output for downstream processing
+python scripts/find_scenes.py --scenario theft --json
+```
+
 ## Run API
 ```bash
 uvicorn api.server:app --reload --port 8000
