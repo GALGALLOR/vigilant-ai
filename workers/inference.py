@@ -54,7 +54,6 @@ image = (
         "qwen-vl-utils",
         "huggingface_hub",
         "einops",
-        "actian-vector",
     )
     .env({"HF_HOME": MODEL_DIR, "TRANSFORMERS_CACHE": MODEL_DIR})
 )

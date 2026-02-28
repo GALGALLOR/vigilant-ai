@@ -67,6 +67,7 @@ pytest -q
 - **Model cache issues:** ensure `vigilant-model-weights` exists and mounts at `/models`.
 - **No events output:** input may be static or rejected by quality gate (`quality_score < 0.08`).
 - **Actian indexing skipped:** pipeline continues even if VectorDB package/endpoint is unavailable.
+- **Modal image build failure for `actian-vector`:** not required for this pipeline image; Actian integration remains optional via backend-side `cortex` client setup.
 
 
 ## Domain labels
