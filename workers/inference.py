@@ -169,7 +169,9 @@ class FeatureExtractor:
         end_ms = int(spec["end"] * 1000)
         people_count = 0
         vehicle_count = 0
+        dog_count = 0
         objects = set()
+        object_freq: Dict[str, int] = {}
         person_boxes_by_frame: List[List[List[float]]] = []
 
         for _ in range(12):
@@ -183,12 +185,15 @@ class FeatureExtractor:
                 cls = int(box.cls.item())
                 name = result.names.get(cls, str(cls))
                 objects.add(name)
+                object_freq[name] = object_freq.get(name, 0) + 1
                 xyxy = box.xyxy[0].tolist()
                 if name == "person":
                     people_count += 1
                     person_boxes.append(xyxy)
                 if name in {"car", "truck", "bus", "motorcycle"}:
                     vehicle_count += 1
+                if name == "dog":
+                    dog_count += 1
             person_boxes_by_frame.append(person_boxes)
 
         cap.release()
@@ -200,7 +205,7 @@ class FeatureExtractor:
             return {"drop": True, "reason": "low_quality", "quality_score": quality_score}
 
         contact_score = _contact_score(person_boxes_by_frame)
-        caption = _simple_caption(people_count, vehicle_count, objects)
+        caption = _simple_caption(people_count, dog_count, vehicle_count, objects, object_freq, contact_score, spec.get("peak_motion", 0.0))
         tags = extract_caption_threats(caption)
 
         signals = {
@@ -209,6 +214,7 @@ class FeatureExtractor:
             "mean_motion": spec.get("mean_motion", 0.0),
             "people_count": people_count,
             "vehicle_count": vehicle_count,
+            "dog_count": dog_count,
             "after_hours": 1 if is_after_hours(datetime.now()) else 0,
         }
         label, confidence, score_map = label_from_signals(signals, tags)
@@ -222,6 +228,7 @@ class FeatureExtractor:
             "end_ms": end_ms,
             "people_count": people_count,
             "vehicle_count": vehicle_count,
+            "dog_count": dog_count,
             "objects": sorted(objects),
             "contact_score": contact_score,
             "caption": caption,
@@ -229,6 +236,7 @@ class FeatureExtractor:
             "label": label,
             "confidence": confidence,
             "score_map": score_map,
+            "object_frequency": object_freq,
             "alert_score": alert_score,
             "alert_stage": stage,
             "alert_reason": reason,
@@ -249,11 +257,40 @@ def _frame_quality(frame) -> float:
     return round((brightness + sharpness) / 2.0, 4)
 
 
-def _simple_caption(people_count: int, vehicle_count: int, objects: set[str]) -> str:
-    base = f"{people_count} people and {vehicle_count} vehicles detected"
-    if "person" in objects and people_count >= 2:
-        base += ", possible human interaction"
-    return base
+def _simple_caption(
+    people_count: int,
+    dog_count: int,
+    vehicle_count: int,
+    objects: set[str],
+    object_freq: Dict[str, int],
+    contact_score: float,
+    peak_motion: float,
+) -> str:
+    parts = [f"{people_count} people", f"{dog_count} dogs", f"{vehicle_count} vehicles"]
+    if object_freq:
+        top_objects = sorted(object_freq.items(), key=lambda item: item[1], reverse=True)[:5]
+        parts.append("objects " + ", ".join(name for name, _ in top_objects))
+
+    if dog_count > 0 and contact_score > 0.35:
+        parts.append("dogs fighting growling dog biting dog aggression")
+    elif dog_count > 0:
+        parts.append("dog playing puppy wagging")
+
+    if people_count >= 2 and contact_score > 0.40:
+        parts.append("fight attack punch aggressive behavior")
+    elif people_count >= 2:
+        parts.append("handshake hug helping assist")
+
+    if peak_motion > 0.45:
+        parts.append("fall collapsed distress emergency")
+
+    if "backpack" in objects or "handbag" in objects or "suitcase" in objects:
+        parts.append("theft stealing snatch and run suspicious loitering tampering")
+
+    if "car" in objects and ("person" in objects):
+        parts.append("vehicle break in window smash")
+
+    return "; ".join(parts)
 
 
 def _cheap_embedding(frames) -> List[float]:

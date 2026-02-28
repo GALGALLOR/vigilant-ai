@@ -1,12 +1,12 @@
 # vigilant-ai
 
-AI video analytics pipeline orchestrated locally and executed on Modal.
+AI video analytics pipeline orchestrated locally and executed on Modal for Human Safety, Dog Safety, and Anti-Theft detection.
 
 ## What it does
 - Uploads local MP4 to Modal Volume `vigilant-videos`
 - Splits input into **5-minute chunks** (CPU workers)
 - Detects motion windows and creates **10s subclips** with 2s overlap
-- Runs GPU inference per subclip (YOLO + CLIP scaffold + Qwen2-VL model reference)
+- Runs GPU inference per subclip (YOLO + CLIP scaffold + Qwen2-VL model reference) with expanded keyword-driven inference for human/dog/antitheft scenes
 - Produces:
   - `results/events.json` (full events, includes `_clip_embedding` + `_track_trajectories`)
   - `results/alerts.json` (heavy fields stripped)
@@ -67,3 +67,9 @@ pytest -q
 - **Model cache issues:** ensure `vigilant-model-weights` exists and mounts at `/models`.
 - **No events output:** input may be static or rejected by quality gate (`quality_score < 0.08`).
 - **Actian indexing skipped:** pipeline continues even if VectorDB package/endpoint is unavailable.
+
+
+## Domain labels
+- Human safety: handshake, hug, helping_gesture, aggressive_behavior, physical_altercation, weapon_detected, person_fallen, medical_emergency, person_in_distress, intruder_detected, after_hours_activity
+- Dog safety: dog_playing, dog_aggression, dog_fight, dog_injury_risk, dog_in_distress, dog_leash_incident, dog_left_in_hot_area
+- Anti-theft: theft_suspected, shoplifting_suspected, package_theft, vehicle_break_in, snatch_and_run, tampering_detected, suspicious_loitering
