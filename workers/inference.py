@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+# Ensure project root is importable when Modal executes this file from /root.
+for _candidate in [Path.cwd(), Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent, Path("/workspace/vigilant-ai")]:
+    if (_candidate / "workers").exists() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
 
 import modal
 
