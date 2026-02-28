@@ -1,0 +1,14 @@
+# Actian VectorAI DB — runs locally on port 50051 (gRPC)
+# Start:  docker compose up -d
+# Stop:   docker compose down
+
+services:
+  vectoraidb:
+    image: williamimoh/actian-vectorai-db:1.0b
+    container_name: vigilant_vectoraidb
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./vectordb_data:/data   # persist collections + logs outside container
+    restart: unless-stopped
+    stop_grace_period: 2m
