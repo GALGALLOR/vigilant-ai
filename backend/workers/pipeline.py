@@ -47,7 +47,15 @@ CAPTION_KEYWORDS = {
     "crowd": "crowd", "group": "crowd",
     "loiter": "loitering", "wait": "loitering",
     "vehicle": "vehicle", "car": "vehicle", "truck": "vehicle",
+        "steal": "theft",
+    "stealing": "theft",
+    "shoplift": "theft",
+    "shoplifting": "theft",
+    "snatch": "theft",
+    "pocket": "concealment",
+    "conceal": "concealment",
 }
+
 
 
 # ─── Expanded Event Taxonomy (21+ types across 7+ categories) ─────────────────
@@ -95,10 +103,24 @@ EVENT_TAXONOMY: Dict[str, List[str]] = {
         "vandalism",
         "property_damage",
     ],
+    # Add to EVENT_TAXONOMY
+    "theft": [
+        "shoplifting",
+        "theft_in_progress",
+        "burglary_suspected",
+        "concealment_suspected",
+        "snatch_and_run",
+    ],
 }
 
 # Severity tiers: critical/high/medium/low
 EVENT_SEVERITY: Dict[str, str] = {
+    # Add to EVENT_SEVERITY
+    "theft_in_progress": "high",
+    "shoplifting": "high",
+    "snatch_and_run": "high",
+    "burglary_suspected": "critical",
+    "concealment_suspected": "medium",
     # Violence
     "weapon_detected": "critical",
     "physical_altercation": "high",
@@ -161,6 +183,44 @@ _SEVERITY_RANK: Dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 
 #             intrusion, suspicious, crowd, vehicle, abandonment
 
 THREAT_KEYWORDS: Dict[str, Tuple[str, float]] = {
+    # Add theft keywords inside THREAT_KEYWORDS
+    # category name: "theft"
+    "theft": ("theft", 0.85),
+    "steal": ("theft", 0.90),
+    "stealing": ("theft", 0.95),
+    "stole": ("theft", 0.90),
+    "rob": ("theft", 0.95),
+    "robbery": ("theft", 1.00),
+    "shoplift": ("theft", 1.00),
+    "shoplifting": ("theft", 1.00),
+    "snatch": ("theft", 0.95),
+    "snatching": ("theft", 1.00),
+    "grab": ("theft", 0.70),
+    "grabbing": ("theft", 0.75),
+    "take": ("theft", 0.55),
+    "taking": ("theft", 0.60),
+    "swipe": ("theft", 0.70),
+    "swiping": ("theft", 0.75),
+    "conceal": ("theft", 0.90),
+    "concealing": ("theft", 0.95),
+    "hide": ("theft", 0.65),
+    "hiding": ("theft", 0.70),
+    "pocket": ("theft", 0.90),
+    "pocketing": ("theft", 0.95),
+    "stuff": ("theft", 0.60),
+    "stuffing": ("theft", 0.70),
+    "bag": ("theft", 0.45),
+    "backpack": ("theft", 0.55),
+    "handbag": ("theft", 0.55),
+    "suitcase": ("theft", 0.55),
+    "run out": ("theft", 0.80),
+    "flee": ("theft", 0.80),
+    "fleeing": ("theft", 0.85),
+    "escape": ("theft", 0.70),
+    "escaping": ("theft", 0.75),
+    "cash register": ("theft", 0.85),
+    "counter": ("theft", 0.45),
+    "checkout": ("theft", 0.55),
     # violence
     "fight": ("violence", 0.85),
     "fighting": ("violence", 0.90),
@@ -685,6 +745,59 @@ def label_from_signals(
 
     caption_threats = extract_caption_threats(caption)
     threat_by_cat: Dict[str, float] = {}
+
+    theft_strength = threat_by_cat.get("theft", 0.0)
+    intrusion_strength = threat_by_cat.get("intrusion", 0.0)  # already in your code
+    running_strength = threat_by_cat.get("running", 0.0)      # already in your code
+    pursuit_strength = threat_by_cat.get("pursuit", 0.0)      # already in your code
+
+    # ── Theft ────────────────────────────────────────────────────────────────
+    # Heuristic idea:
+    # - Shoplifting: theft language + single/few people + moderate motion + some dwell
+    # - Snatch & run: theft language + high motion and/or running/pursuit language
+    # - Burglary suspected: after-hours + intrusion language + presence
+
+    if theft_strength > 0.0:
+        # Concealment suspected: pocketing/hiding language tends to show up in captions.
+        _add_hypothesis(
+            acc,
+            "concealment_suspected",
+            0.45 + min(theft_strength, 2.0) * 0.18 + 0.10 * dwell_n,
+        )
+
+        # Shoplifting: longer dwell + theft language + not necessarily high contact.
+        if people_count >= 1:
+            _add_hypothesis(
+                acc,
+                "shoplifting",
+                0.55 + min(theft_strength, 2.0) * 0.20 + 0.15 * dwell_n + 0.10 * motion_n,
+            )
+
+        # Theft in progress: theft language + higher motion (active grabbing/escaping)
+        if peak_motion > 0.25:
+            _add_hypothesis(
+                acc,
+                "theft_in_progress",
+                0.58 + min(theft_strength, 2.0) * 0.22 + 0.15 * motion_n,
+            )
+
+        # Snatch-and-run: theft + running/pursuit signals
+        if running_strength > 0.0 or pursuit_strength > 0.0 or peak_motion > 0.45:
+            _add_hypothesis(
+                acc,
+                "snatch_and_run",
+                0.60 + 0.20 * motion_n + 0.12 * min(running_strength + pursuit_strength, 2.0)
+                + 0.12 * min(theft_strength, 2.0),
+            )
+
+    # Burglary suspected: after-hours + intrusion + presence (even if caption doesn't say "steal")
+    if after_hours_flag and people_count >= 1 and (intrusion_strength > 0.0 or peak_motion > 0.30):
+        _add_hypothesis(
+            acc,
+            "burglary_suspected",
+            0.55 + 0.18 * motion_n + 0.18 * min(intrusion_strength, 2.0) + 0.10 * people_n,
+        )
+
     for t in caption_threats:
         cat = str(t.get("category", ""))
         w = float(t.get("weight", 0.0))
@@ -1013,10 +1126,11 @@ def compute_alert_score(
             break
 
     threat_gate = False
+    
     threat_weight_sum = 0.0
     for t in caption_threats:
         threat_weight_sum += float(t.get("weight", 0.0) or 0.0)
-        if str(t.get("category", "")) in ("weapon", "fire", "medical", "violence") and float(t.get("weight", 0.0) or 0.0) >= 0.75:
+        if str(t.get("category", "")) in ("weapon", "fire", "medical", "violence", "theft") and float(t.get("weight", 0.0) or 0.0) >= 0.75:
             threat_gate = True
 
     stage_a = (
@@ -1050,7 +1164,12 @@ def compute_alert_score(
     sev_mult = float(SEVERITY_MULTIPLIERS.get(highest_sev, 1.0))
 
     # Caption threat boost
-    caption_boost = min(float(threat_weight_sum) * 0.05, 0.15)
+    theft_bonus = 0.0
+    for t in caption_threats:
+        if str(t.get("category","")) == "theft":
+            theft_bonus += float(t.get("weight", 0.0) or 0.0)
+
+    caption_boost = min(threat_weight_sum * 0.05 + min(theft_bonus * 0.03, 0.08), 0.22)
 
     score = base_score * sev_mult + caption_boost
     score = round(min(max(score, 0.0), 1.0), 3)

@@ -59,6 +59,8 @@ CLIP_MODEL_ID     = "openai/clip-vit-large-patch14"
 VLM_MODEL_ID      = "Qwen/Qwen2-VL-7B-Instruct"   # multi-frame video understanding
 MODEL_CACHE_DIR   = "/models"      # path inside Modal Volume
 
+VIDEO_URL = "shoplifting2.mp4"
+
 # Expanded COCO classes to detect beyond just person/vehicle
 EXPANDED_OBJECTS  = {"backpack", "handbag", "suitcase", "bottle", "chair",
                      "cell phone", "laptop", "knife", "scissors", "fire hydrant"}
@@ -498,6 +500,21 @@ class FeatureExtractor:
         caption = self._vlm_caption(kf_pil, track_summaries, people_max, vehicle_max,
                                     round(contact_score, 3), round(window["peak_motion"], 3))
 
+        #---
+        # Simple theft context: presence of carry/valuable items
+        carry_items = {"backpack", "handbag", "suitcase"}
+        valuable_items = {"cell phone", "laptop"}
+
+        has_carry = any(k in (objects_seen or {}) for k in carry_items)
+        has_valuable = any(k in (objects_seen or {}) for k in valuable_items)
+
+        # Optional: append hint words into caption to help the caption keyword extractor
+        # (keeps doors open without changing pipeline function signatures)
+        if has_carry:
+            caption = caption + " (person has a bag/backpack)"
+        if has_valuable:
+            caption = caption + " (valuable item visible)"
+        #---
         # ── Layer 5 — Signal-based event labeling ─────────────────────────────
         hypotheses, tags = label_from_signals(
             people_count      = people_max,
@@ -687,7 +704,7 @@ class FeatureExtractor:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.local_entrypoint()
-def main(video_path: str = "test.mp4"):
+def main(video_path: str = VIDEO_URL):
     """
     Runs on your local machine — orchestrates everything on Modal.
 
