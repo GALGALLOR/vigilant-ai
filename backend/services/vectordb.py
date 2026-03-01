@@ -63,19 +63,54 @@ def ensure_collection() -> None:
 def ingest_events(events: List[Dict[str, Any]]) -> int:
     """
     Batch-insert a list of EventJSON dicts into VectorAI DB.
-    Each event must have a 'clip_embedding' (768-dim list) and 'clip_id'.
+    Each event must have a '_clip_embedding' (768-dim list) and 'clip_id'.
+    Handles nested [[768 floats]] format by flattening.
 
     Returns number of events successfully inserted.
     """
     from cortex import CortexClient
 
-    # Filter out events with no embedding (processing errors)
-    valid = [e for e in events
-             if e.get("_clip_embedding") and len(e["_clip_embedding"]) == EMBEDDING_DIM]
-    if not valid:
-        # Fallback: try legacy key
-        valid = [e for e in events
-                 if e.get("clip_embedding") and len(e["clip_embedding"]) == EMBEDDING_DIM]
+    def _flatten_embedding(emb):
+        """Flatten [[768 floats]] → [768 floats] and parse JSON strings.
+        Also coerces all elements to Python float so cortex client never
+        rejects the vector with 'must be real number, not list/int'.
+        """
+        if not emb:
+            return None
+
+        import json
+        if isinstance(emb, str):
+            try:
+                emb = json.loads(emb)
+            except Exception:
+                return None
+
+        # Unwrap single-element nesting: [[...]] → [...]
+        if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
+            emb = emb[0]
+
+        if not (isinstance(emb, list) and len(emb) == EMBEDDING_DIM):
+            return None
+
+        # Coerce every element to a plain Python float.
+        # Numpy floats, torch scalars, or ints will all satisfy cortex's
+        # type check after this, and json round-trips stay as floats.
+        try:
+            emb = [float(x) for x in emb]
+        except (TypeError, ValueError):
+            return None
+
+        return emb
+
+    # Filter and flatten embeddings
+    valid = []
+    for e in events:
+        raw = e.get("_clip_embedding") or e.get("clip_embedding")
+        flat = _flatten_embedding(raw)
+        if flat:
+            e["_flat_embedding"] = flat
+            valid.append(e)
+
     if not valid:
         print("⚠️  No valid embeddings to insert")
         return 0
@@ -88,9 +123,10 @@ def ingest_events(events: List[Dict[str, Any]]) -> int:
 
     for e in valid:
         # clip_id format: "c00_w0003" → hash to stable int
+
         vec_id = abs(hash(e["clip_id"])) % (2**31)
         ids.append(vec_id)
-        vectors.append(e.get("_clip_embedding") or e.get("clip_embedding"))
+        vectors.append(e["_flat_embedding"])
 
         # Payload = everything except heavy fields
         payload = {k: v for k, v in e.items()
@@ -105,6 +141,9 @@ def ingest_events(events: List[Dict[str, Any]]) -> int:
         if "time" in payload and isinstance(payload["time"], dict):
             payload["start_ms"] = payload["time"].get("start_ms")
             payload["end_ms"] = payload["time"].get("end_ms")
+        # Ensure video_id is in payload for per-video filtering
+        if "video_source" in payload:
+            payload["video_id"] = payload["video_source"].replace(".", "_").replace(" ", "_")
         payloads.append(payload)
 
     with CortexClient(VECTORDB_HOST) as client:
@@ -162,6 +201,7 @@ def search_by_vector(
             "payload":     r.payload,
         }
         for r in results
+        if r.payload is not None
     ]
 
 

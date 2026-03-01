@@ -35,7 +35,11 @@ CREATE TABLE IF NOT EXISTS videos (
     total_alerts    INTEGER DEFAULT 0,
     processing_time_s REAL,
     gpu             TEXT,
-    upload_time     TEXT NOT NULL
+    upload_time     TEXT NOT NULL,
+    chunks          INTEGER DEFAULT 0,
+    subclips        INTEGER DEFAULT 0,
+    cpu_time_s      REAL DEFAULT 0,
+    gpu_time_s      REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -105,6 +109,30 @@ CREATE INDEX IF NOT EXISTS idx_events_start_ms    ON events(start_ms);
 CREATE INDEX IF NOT EXISTS idx_events_event_type  ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_alert_score ON events(alert_score DESC);
 CREATE INDEX IF NOT EXISTS idx_tracks_clip_id     ON tracks(clip_id);
+
+-- Gemini synthesis: holistic video understanding
+CREATE TABLE IF NOT EXISTS video_summaries (
+    video_id    TEXT PRIMARY KEY,
+    summary     TEXT,
+    intent      TEXT,       -- JSON array
+    key_moments TEXT,       -- JSON array of {time, description}
+    risk_level  TEXT DEFAULT 'medium',
+    tags        TEXT,       -- JSON array
+    created_at  TEXT,
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+);
+
+-- Persistent chat history
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id    TEXT NOT NULL,
+    role        TEXT NOT NULL,   -- 'user' or 'assistant'
+    content     TEXT NOT NULL,
+    results_json TEXT,           -- search results JSON if any
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_video ON chat_messages(video_id, created_at);
 """
 
 
@@ -120,6 +148,17 @@ def init_db() -> None:
     """Create tables and indexes. Safe to call multiple times (IF NOT EXISTS)."""
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # Migrate: add new columns to existing videos tables
+        for col, typedef in [
+            ("chunks",      "INTEGER DEFAULT 0"),
+            ("subclips",    "INTEGER DEFAULT 0"),
+            ("cpu_time_s",  "REAL DEFAULT 0"),
+            ("gpu_time_s",  "REAL DEFAULT 0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass  # column already exists
     print(f"✅ SQLite DB ready at {DB_PATH.resolve()}")
 
 
@@ -133,17 +172,23 @@ def insert_video(
     total_alerts: int,
     processing_time_s: float,
     gpu: str,
+    chunks: int = 0,
+    subclips: int = 0,
+    cpu_time_s: float = 0.0,
+    gpu_time_s: float = 0.0,
 ) -> None:
     """Insert or replace a video record."""
     with get_conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO videos
               (id, name, duration_s, total_events, total_alerts,
-               processing_time_s, gpu, upload_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               processing_time_s, gpu, upload_time,
+               chunks, subclips, cpu_time_s, gpu_time_s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             video_id, name, duration_s, total_events, total_alerts,
             processing_time_s, gpu, datetime.utcnow().isoformat() + "Z",
+            chunks, subclips, cpu_time_s, gpu_time_s,
         ))
 
 
@@ -398,6 +443,82 @@ def get_stats() -> Dict[str, Any]:
         "total_tracks": tracks["n"],
         "latest_video": dict(latest) if latest else None,
     }
+
+
+# ─── Video Summaries ──────────────────────────────────────────────────────────
+
+def save_video_summary(video_id: str, synthesis: Dict) -> None:
+    """Save Gemini synthesis result."""
+    from datetime import datetime
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO video_summaries "
+            "(video_id, summary, intent, key_moments, risk_level, tags, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                video_id,
+                synthesis.get("summary", ""),
+                json.dumps(synthesis.get("intent", [])),
+                json.dumps(synthesis.get("key_moments", [])),
+                synthesis.get("risk_level", "medium"),
+                json.dumps(synthesis.get("tags", [])),
+                datetime.utcnow().isoformat() + "Z",
+            ),
+        )
+
+
+def get_video_summary(video_id: str) -> Optional[Dict]:
+    """Get Gemini synthesis result for a video."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM video_summaries WHERE video_id = ?", (video_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "video_id": row["video_id"],
+        "summary": row["summary"],
+        "intent": json.loads(row["intent"] or "[]"),
+        "key_moments": json.loads(row["key_moments"] or "[]"),
+        "risk_level": row["risk_level"],
+        "tags": json.loads(row["tags"] or "[]"),
+        "created_at": row["created_at"],
+    }
+
+
+# ─── Chat Messages ────────────────────────────────────────────────────────────
+
+def save_chat_message(video_id: str, role: str, content: str, results_json: str = None) -> int:
+    """Save a chat message (user or assistant). Returns message ID."""
+    from datetime import datetime
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO chat_messages (video_id, role, content, results_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (video_id, role, content, results_json, datetime.utcnow().isoformat() + "Z"),
+        )
+        return cursor.lastrowid
+
+
+def get_chat_history(video_id: str, limit: int = 50) -> List[Dict]:
+    """Get chat history for a video, ordered by time."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, role, content, results_json, created_at "
+            "FROM chat_messages WHERE video_id = ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (video_id, limit),
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "role": r["role"],
+            "content": r["content"],
+            "results": json.loads(r["results_json"]) if r["results_json"] else None,
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
 
 
 # ─── CLI test ─────────────────────────────────────────────────────────────────
