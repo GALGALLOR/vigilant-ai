@@ -3,10 +3,10 @@ Vigilant-AI — Modal Pipeline
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Layer 0  │ Chunker + Motion Scorer        │ Modal CPU  (parallel, one per 5-min chunk)
 Layer 1  │ Quality Gate                   │ (inside Layer 0)
-Layer 2  │ YOLO Detection + Tracking      │ Modal GPU — A10G  (one per 10s sub-clip)
-Layer 3  │ CLIP ViT-L/14 Embeddings       │ Modal GPU — A10G  (same container)
-Layer 4  │ Florence-2-Large Captioning    │ Modal GPU — A10G  (same container)
-Layer 5  │ Event JSON Assembly            │ in-process (GPU container)
+Layer 2  │ YOLO Detection + Tracking      │ Modal GPU — A100  (one per 10s sub-clip)
+Layer 3  │ CLIP ViT-L/14 Embeddings       │ Modal GPU — A100  (same container)
+Layer 4  │ Gemini 2.0 Flash Vision        │ API call  (from GPU container, no censorship)
+Layer 5  │ Signal-based Event Labeling    │ in-process (GPU container)
 Layer 6  │ Alert Scoring (Stage A/B/C)    │ in-process (GPU container)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -56,7 +56,8 @@ ALERT_C_THRESHOLD = 0.70
 YOLO_CONF         = 0.25           # lower = catch more subtle detections
 YOLO_MODEL        = "yolo11l.pt"
 CLIP_MODEL_ID     = "openai/clip-vit-large-patch14"
-VLM_MODEL_ID      = "Qwen/Qwen2-VL-7B-Instruct"   # multi-frame video understanding
+GEMINI_MODEL_ID   = "gemini-2.0-flash"             # vision API — no censorship, fast
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "AIzaSyABZMPfjVnsPu3aYpnuFqhORorteVao6wo")
 MODEL_CACHE_DIR   = "/models"      # path inside Modal Volume
 
 # Expanded COCO classes to detect beyond just person/vehicle
@@ -86,12 +87,9 @@ vigilant_image = (
         "Pillow>=10.0.0",
         "opencv-python-headless>=4.9.0",
         "numpy",
-        "einops",
-        "timm",
         "huggingface_hub",
-        "sentencepiece",
-        "qwen-vl-utils",
         "accelerate>=0.26.0",
+        "google-genai>=1.0.0",
     ])
     .add_local_python_source("workers")
 )
@@ -104,24 +102,22 @@ app = modal.App("vigilant-ai", image=vigilant_image)
 
 @app.function(
     volumes={MODEL_CACHE_DIR: model_vol},
-    timeout=3600,
+    timeout=1800,
     image=vigilant_image,
 )
 def download_models():
     """
-    One-time setup: downloads all model weights into the Modal Volume.
+    One-time setup: downloads YOLO + CLIP weights into the Modal Volume.
+    Captioning is handled by Gemini API (no local VLM weights needed).
     After this runs, containers read from the volume — no internet needed.
     """
     import os, shutil, glob
     os.environ["HF_HOME"]            = MODEL_CACHE_DIR
     os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
-    os.environ["YOLO_CONFIG_DIR"]    = "/tmp/Ultralytics"   # suppress writable warning
+    os.environ["YOLO_CONFIG_DIR"]    = "/tmp/Ultralytics"
 
     from ultralytics import YOLO
-    from transformers import (
-        CLIPModel, CLIPProcessor,
-        Qwen2VLForConditionalGeneration, AutoProcessor,
-    )
+    from transformers import CLIPModel, CLIPProcessor
 
     print("⬇️  YOLOv11-L...")
     YOLO(YOLO_MODEL)
@@ -136,16 +132,9 @@ def download_models():
     CLIPModel.from_pretrained(CLIP_MODEL_ID,     cache_dir=MODEL_CACHE_DIR)
     CLIPProcessor.from_pretrained(CLIP_MODEL_ID, cache_dir=MODEL_CACHE_DIR)
 
-    print("⬇️  Qwen2-VL-7B-Instruct (multi-frame video understanding)...")
-    Qwen2VLForConditionalGeneration.from_pretrained(
-        VLM_MODEL_ID, torch_dtype="auto", cache_dir=MODEL_CACHE_DIR,
-    )
-    AutoProcessor.from_pretrained(
-        VLM_MODEL_ID, cache_dir=MODEL_CACHE_DIR,
-    )
-
     model_vol.commit()
-    print("✅ All models saved to Modal Volume 'vigilant-model-weights'")
+    print("✅ YOLO + CLIP saved to Modal Volume 'vigilant-model-weights'")
+    print("ℹ️  Captioning handled by Gemini 2.0 Flash API — no VLM weights needed")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -314,10 +303,10 @@ class FeatureExtractor:
     extract_from_window is called for each 10s sub-clip via .map().
 
     Layer 2 — YOLOv11-L detection + ByteTrack tracking
-    Layer 3 — CLIP ViT-L/14 embedding (avg of 3 keyframes)
-    Layer 4 — Florence-2-Large captioning (mid-window keyframe)
-    Layer 5 — Signal-based event labeling
-    Layer 6 — Alert scoring: Stage A (rules) → B (score) → C (LLM verify)
+    Layer 3 — CLIP ViT-L/14 embedding (avg of 5 keyframes, 768-dim, L2-normalized)
+    Layer 4 — Gemini 2.0 Flash Vision captioning (5 keyframes → forensic JSON)
+    Layer 5 — Signal-based multi-hypothesis event labeling (pipeline.py)
+    Layer 6 — Alert scoring: Stage A (rules) → B (score) → C threshold
     """
 
     @modal.enter()
@@ -326,16 +315,13 @@ class FeatureExtractor:
         import os
         import torch
         from ultralytics import YOLO
-        from transformers import (
-            CLIPModel, CLIPProcessor,
-            AutoModelForCausalLM, AutoProcessor,
-        )
+        from transformers import CLIPModel, CLIPProcessor
+
         os.environ["HF_HOME"]            = MODEL_CACHE_DIR
         os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
         os.environ["YOLO_CONFIG_DIR"]    = "/tmp/Ultralytics"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype  = torch.float16 if self.device == "cuda" else torch.float32
         print(f"🚀 Container | device={self.device} | gpu={GPU_TYPE}")
 
         self.yolo = YOLO(YOLO_MODEL)
@@ -348,19 +334,7 @@ class FeatureExtractor:
             CLIP_MODEL_ID, cache_dir=MODEL_CACHE_DIR
         )
         self.clip_model.eval()
-        print("✅ CLIP ViT-L/14")
-
-        from transformers import Qwen2VLForConditionalGeneration
-        self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
-            VLM_MODEL_ID, torch_dtype=self.dtype,
-            attn_implementation="sdpa",   # no flash_attn needed
-            cache_dir=MODEL_CACHE_DIR,
-        ).to(self.device)
-        self.vlm_proc = AutoProcessor.from_pretrained(
-            VLM_MODEL_ID, cache_dir=MODEL_CACHE_DIR,
-        )
-        self.vlm.eval()
-        print(f"✅ Qwen2-VL-7B (SDPA) | 🟢 Container ready on {GPU_TYPE}")
+        print(f"✅ CLIP ViT-L/14 | 🟢 Container ready on {GPU_TYPE}")
 
     @modal.method()
     def extract_from_window(self, window: Dict) -> Dict:
@@ -369,10 +343,6 @@ class FeatureExtractor:
         import numpy as np
         import torch
         from PIL import Image
-        from workers.pipeline import (
-            max_pairwise_iou, label_from_signals,
-            compute_alert_score, ALERT_C_THRESHOLD,
-        )
 
         video_path = f"/data/{window['video_source']}"
         win_start  = window["start_sec"]
@@ -415,8 +385,8 @@ class FeatureExtractor:
 
         people_max  = 0
         vehicle_max = 0
+        contact_score = 0.0             # max pairwise IoU across all frames
         person_tracks: Dict = {}
-        contact_score       = 0.0
         objects_seen: Dict[str, int] = {}   # expanded class counts
         first_detection_ms: float = -1
         last_detection_ms:  float = -1
@@ -452,7 +422,10 @@ class FeatureExtractor:
 
             people_max  = max(people_max,  np_)
             vehicle_max = max(vehicle_max, nv_)
+
+            # Contact score: max bounding-box IoU between any two people this frame
             if len(person_boxes_frame) >= 2:
+                from workers.pipeline import max_pairwise_iou
                 contact_score = max(contact_score, max_pairwise_iou(person_boxes_frame))
 
         # Build track summaries (trajectories go to DB only, not JSON)
@@ -475,8 +448,8 @@ class FeatureExtractor:
 
         max_dwell = max((t["dwell_seconds"] for t in track_summaries), default=0.0)
 
-        # ── Keyframes: start / mid / end ──────────────────────────────────────
-        kf_indices = [0, len(frames) // 2, len(frames) - 1]
+        # ── Keyframes: 5 evenly spaced frames ─────────────────────────────────
+        kf_indices = [int(i * (len(frames) - 1) / 4) for i in range(5)]
         kf_pil: List = []
         for ki in kf_indices:
             _, bgr = frames[min(ki, len(frames)-1)]
@@ -485,54 +458,83 @@ class FeatureExtractor:
         # ── Layer 3 — CLIP Embedding (avg over keyframes) ─────────────────────
         with torch.no_grad():
             ci = self.clip_processor(images=kf_pil, return_tensors="pt", padding=True)
-            ci = {k: v.to(self.device) for k, v in ci.items()}
-            feats = self.clip_model.get_image_features(**ci)
-            # transformers 5.x returns BaseModelOutputWithPooling; extract tensor
-            if hasattr(feats, 'image_embeds'):
-                feats = feats.image_embeds
-            elif not isinstance(feats, torch.Tensor):
-                feats = feats[0]  # first element is the tensor
-            clip_vec = feats.mean(dim=0).cpu().float().tolist()
+            pixel_values = ci["pixel_values"].to(self.device)
+            # Use vision_model + visual_projection directly.
+            # get_image_features() has version-dependent return shapes in newer
+            # transformers (can return [batch, seq_len, hidden] instead of [batch, 768]).
+            # Accessing sub-modules directly gives guaranteed stable shapes:
+            #   vision_model -> pooler_output: [N, 1024] (CLS token, ViT-L/14 hidden size)
+            #   visual_projection: Linear(1024 → 768) -> [N, 768]
+            vision_out = self.clip_model.vision_model(pixel_values=pixel_values)
+            pooled  = vision_out.pooler_output                  # [N, 1024]
+            feats   = self.clip_model.visual_projection(pooled) # [N, 768]
+            feats   = feats / feats.norm(dim=-1, keepdim=True)  # L2 norm per frame
+            clip_vec_t = feats.mean(dim=0)                      # [768]
+            clip_vec_t = clip_vec_t / clip_vec_t.norm()         # L2 norm final
+            clip_vec = clip_vec_t.cpu().float().tolist()        # flat list, always 768
 
-        # ── Layer 4 — Qwen2-VL multi-frame caption ─────────────────────────
-        caption = self._vlm_caption(kf_pil, track_summaries, people_max, vehicle_max,
-                                    round(contact_score, 3), round(window["peak_motion"], 3))
-
-        # ── Layer 5 — Signal-based event labeling ─────────────────────────────
-        hypotheses, tags = label_from_signals(
-            people_count      = people_max,
-            vehicle_count     = vehicle_max,
-            contact_score     = contact_score,
-            peak_motion       = window["peak_motion"],
-            dwell_seconds     = max_dwell,
-            after_hours_flag  = window["is_after_hours"],
-            caption           = caption,
+        assert len(clip_vec) == 768 and isinstance(clip_vec[0], float), (
+            f"CLIP image embed: expected 768 floats, got len={len(clip_vec)}"
         )
-        # Top hypothesis → primary event label
+
+        # ── Layer 4 — Gemini 2.0 Flash Vision caption ──────────────────────
+        vlm_data = self._vlm_caption(kf_pil)
+        caption = vlm_data.get("description", "No description")
+
+        # ── Layer 5 — Signal-based multi-hypothesis event labeling ──────────
+        from workers.pipeline import (
+            label_from_signals, compute_alert_score, extract_caption_threats,
+        )
+
+        hypotheses, tags = label_from_signals(
+            people_count    = people_max,
+            vehicle_count   = vehicle_max,
+            contact_score   = contact_score,
+            peak_motion     = window["peak_motion"],
+            dwell_seconds   = max_dwell,
+            after_hours_flag= window["is_after_hours"],
+            caption         = caption,
+        )
+
+        # VLM boolean flags can force high-confidence hypotheses
+        if vlm_data.get("is_fighting") and not any(h["label"] == "physical_altercation" for h in hypotheses):
+            hypotheses.insert(0, {"label": "physical_altercation", "confidence": 0.85, "severity": "high"})
+        if vlm_data.get("is_stealing") and not any(h["label"] == "suspicious_behavior" for h in hypotheses):
+            hypotheses.insert(0, {"label": "suspicious_behavior", "confidence": 0.80, "severity": "medium"})
+
+        # Primary event = top hypothesis
         if hypotheses:
             event_label = hypotheses[0]["label"]
             event_conf  = hypotheses[0]["confidence"]
         else:
             event_label = "activity_detected"
-            event_conf  = 0.5
+            event_conf  = 0.30
 
-        # ── Layer 6 — Alert Scoring (Stage A → B → C) ─────────────────────────
+        # ── Layer 6 — Alert Scoring (Stage A / B / C) ───────────────────────
+        caption_threats = extract_caption_threats(caption)
         evidence = {
             "motion":        round(window["peak_motion"], 3),
-            "overlap":       round(contact_score, 3),
+            "overlap":       round(contact_score, 4),
             "dwell_seconds": round(max_dwell, 1),
             "people_count":  float(people_max),
             "vehicle_count": float(vehicle_max),
+            "vlm_flags": {
+                "fighting": vlm_data.get("is_fighting", False),
+                "stealing": vlm_data.get("is_stealing", False),
+                "erratic":  vlm_data.get("is_erratic", False),
+            },
         }
-        alert_score, alert_stage = compute_alert_score(evidence, window["is_after_hours"])
 
-        alert_reason = f"primary={event_label}"
-        if alert_score >= ALERT_C_THRESHOLD:
-            alert_reason = self._stage_c_verify(kf_pil, evidence, event_label)
+        alert_score, alert_stage = compute_alert_score(
+            evidence         = evidence,
+            after_hours_flag = window["is_after_hours"],
+            events_list      = hypotheses,
+            caption_threats  = caption_threats,
+        )
+        alert_reason = event_label
 
-        icon = "🚨" if alert_stage in ("B","C") else "✅"
-        print(f"  {icon} {clip_id}: {event_label} | "
-              f"score={alert_score:.2f} stage={alert_stage} people={people_max}")
+        icon = "🚨" if alert_stage in ("A", "B", "C") else "✅"
+        print(f"  {icon} {clip_id}: {event_label} | people={people_max} | alert={alert_stage}({alert_score:.2f})")
 
         # ── Build clean output ────────────────────────────────────────────────
         # JSON-friendly output: no raw embeddings or trajectory arrays
@@ -566,7 +568,6 @@ class FeatureExtractor:
                 "vehicle_count":  vehicle_max,
                 "peak_motion":    round(window["peak_motion"], 4),
                 "mean_motion":    round(window["mean_motion"], 4),
-                "contact_score":  round(contact_score, 4),
                 "objects":        objects_seen if objects_seen else None,
             },
 
@@ -574,10 +575,11 @@ class FeatureExtractor:
             "tracks":         track_summaries,
             "track_count":    len(track_summaries),
 
-            "event":          {"label": event_label, "confidence": event_conf},
-            "evidence":       evidence,
-            "caption":        caption,
-            "tags":           tags,
+            "event":      {"label": event_label, "confidence": event_conf},
+            "hypotheses": hypotheses,               # full ranked hypothesis list
+            "evidence":   evidence,
+            "caption":    caption,
+            "tags":       tags,
 
             "alert": {
                 "score":  round(alert_score, 3),
@@ -595,68 +597,85 @@ class FeatureExtractor:
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
-    def _vlm_caption(self, keyframes: List, tracks: List[Dict],
-                     people: int, vehicles: int,
-                     contact: float, motion: float) -> str:
+    def _vlm_caption(self, keyframes: List) -> Dict:
         """
-        Multi-frame Qwen2-VL caption. Sends start/mid/end keyframes with
-        detection context so the VLM understands temporal progression.
+        Multi-frame caption using Gemini 2.0 Flash Vision API.
+
+        Sends up to 5 JPEG keyframes + a forensic analysis prompt to Gemini.
+        Returns parsed JSON dict with 'description' and boolean flags.
+        Gemini has no safety filters for forensic/surveillance use-cases —
+        it will accurately describe violence, theft, and other incidents.
         """
-        import torch
-        from qwen_vl_utils import process_vision_info
+        import io, json
+        from google import genai
+        from google.genai import types
 
-        # Build signal context for the VLM
-        track_desc = ""
-        for t in tracks[:4]:
-            track_desc += (f"  Person {t['id']}: present for {t['dwell_seconds']}s "
-                          f"(entered at {t.get('entry_ms',0)/1000:.1f}s, "
-                          f"exited at {t.get('exit_ms',0)/1000:.1f}s)\n")
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
-        prompt = (
-            f"These are 3 frames from a CCTV surveillance clip (start, middle, end of a {len(keyframes)}-frame sequence).\n"
-            f"Detection signals: {people} people detected, {vehicles} vehicles, "
-            f"physical contact score={contact}, motion intensity={motion}.\n"
-            f"{track_desc}"
-            f"Describe in detail: What is happening? Who is doing what to whom? "
-            f"What changed between the start frame and the end frame? "
-            f"Be specific about actions (hitting, falling, running, standing, etc). "
-            f"Keep it under 100 words."
+        prompt_text = (
+            f"You are a Forensic Video Analyst reviewing {len(keyframes)} sequential CCTV keyframes. "
+            "These frames are from a security camera. Your job is objective, accurate description. "
+            "Do NOT use euphemisms. If you see punching, say punching. "
+            "If you see someone concealing merchandise, say that explicitly. "
+            "Pay close attention to hands and body contact between people.\n\n"
+            "Respond ONLY with raw JSON (no markdown, no code fences):\n"
+            '{"description": "Precise chronological description of what is happening. '
+            'Name physical actions explicitly.", '
+            '"is_fighting": true_or_false, '
+            '"is_stealing": true_or_false, '
+            '"is_erratic": true_or_false}'
         )
 
-        # Build multi-image message for Qwen2-VL
-        content = []
-        for i, kf in enumerate(keyframes[:3]):
-            content.append({"type": "image", "image": kf})
-        content.append({"type": "text", "text": prompt})
+        # Build parts: JPEG images first, then text prompt
+        parts = []
+        for kf in keyframes:
+            buf = io.BytesIO()
+            kf.save(buf, format="JPEG", quality=85)
+            parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+        parts.append(types.Part.from_text(text=prompt_text))
 
-        messages = [{"role": "user", "content": content}]
-
-        text = self.vlm_proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.vlm_proc(
-            text=[text], images=image_inputs, videos=video_inputs,
-            padding=True, return_tensors="pt",
-        ).to(self.device)
-
-        with torch.no_grad():
-            ids = self.vlm.generate(
-                **inputs,
-                max_new_tokens=200,
-                do_sample=False,
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_ID,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=512,
+                ),
             )
-        # Trim the input tokens from the output
-        generated = ids[:, inputs.input_ids.shape[1]:]
-        text_out = self.vlm_proc.batch_decode(generated, skip_special_tokens=True)[0].strip()
-        return text_out or "Scene description unavailable."
+            raw = (response.text or "").strip()
+        except Exception as e:
+            print(f"  ⚠️ Gemini API error: {e}")
+            return {"description": "API error", "is_fighting": False, "is_stealing": False, "is_erratic": False}
 
-    def _stage_c_verify(self, keyframes, evidence: Dict, event_label: str) -> str:
-        """Multi-frame VLM analysis for high-risk events (Stage C)."""
-        desc = self._vlm_caption(
-            keyframes[:3], [], int(evidence.get('people_count', 0)),
-            int(evidence.get('vehicle_count', 0)),
-            evidence.get('overlap', 0), evidence.get('motion', 0),
-        )
-        return f"STAGE-C | {event_label} | {desc}"
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw.rsplit("```", 1)[0]
+        if raw.lstrip().startswith("json"):
+            raw = raw.lstrip()[4:]
+        raw = raw.strip()
+
+        try:
+            result = json.loads(raw)
+            # Ensure all expected keys exist
+            return {
+                "description": str(result.get("description", raw[:200])),
+                "is_fighting": bool(result.get("is_fighting", False)),
+                "is_stealing": bool(result.get("is_stealing", False)),
+                "is_erratic":  bool(result.get("is_erratic", False)),
+            }
+        except Exception as e:
+            print(f"  ⚠️ Gemini JSON parse failed: {e} | raw={raw[:120]}")
+            return {
+                "description": raw[:500] if raw else "Parse error",
+                "is_fighting": False,
+                "is_stealing": False,
+                "is_erratic":  False,
+            }
+
+
 
     def _empty_event(self, window: Dict, clip_id: str, reason: str) -> Dict:
         s_ms = round(window["start_sec"] * 1000, 1)
@@ -673,6 +692,7 @@ class FeatureExtractor:
                            "mean_motion": 0, "contact_score": 0, "objects": None},
             "tracks": [], "track_count": 0,
             "event": {"label": "processing_error", "confidence": 0.0},
+            "hypotheses": [],
             "evidence": {"error": reason},
             "_clip_embedding": [], "_track_trajectories": [],
             "caption": reason, "tags": ["error"],

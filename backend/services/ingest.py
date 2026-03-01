@@ -1,10 +1,10 @@
 """
 Sentinel-Stream — Ingest Pipeline Results into Databases
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Called after `modal run workers/inference.py` completes.
-Reads results/events.json and pushes data into:
-  1. SQLite (vigilant.db) — structured events + videos table
-  2. Actian VectorAI (localhost:50051) — CLIP embeddings for similarity search
+After video processing completes, ingests data into:
+  1. SQLite — structured events + videos table
+  2. VectorAI — CLIP embeddings for similarity search
+  3. Gemini — holistic video synthesis (summary + intent)
 
 Usage:
     python -m services.ingest results/events.json
@@ -12,6 +12,7 @@ Usage:
 
 import json
 import sys
+import os
 from pathlib import Path
 
 
@@ -20,14 +21,13 @@ def _strip_private(event: dict) -> dict:
     return {k: v for k, v in event.items() if not k.startswith("_")}
 
 
-def ingest_results(events_json_path: str) -> None:
-    from services.db import init_db, insert_video, insert_events
-    from services.vectordb import ensure_collection, ingest_events
+def ingest_results(events_json_path: str, delete_json: bool = False) -> None:
+    from services.db import init_db, insert_video, insert_events, save_video_summary
 
     path = Path(events_json_path)
     if not path.exists():
-        print(f"❌ File not found: {path}")
-        sys.exit(1)
+        print(f"File not found: {path}")
+        return
 
     with open(path) as f:
         data = json.load(f)
@@ -37,7 +37,7 @@ def ingest_results(events_json_path: str) -> None:
     video_id   = video_name.replace(".", "_").replace(" ", "_")
 
     if not events:
-        print("⚠️  No events in results file")
+        print("No events in results file")
         return
 
     def _get_stage(e):
@@ -47,10 +47,9 @@ def ingest_results(events_json_path: str) -> None:
         return e.get("alert_stage", "none")
     alerts = [e for e in events if _get_stage(e) != "none"]
 
-    print(f"\n📥 Ingesting {len(events)} events for '{video_name}'...")
+    print(f"Ingesting {len(events)} events for '{video_name}'...")
 
     # ── 1. SQLite ──────────────────────────────────────────────────────────────
-    print("  🗄  SQLite...")
     init_db()
     insert_video(
         video_id          = video_id,
@@ -58,25 +57,44 @@ def ingest_results(events_json_path: str) -> None:
         duration_s        = data.get("duration_s", 0),
         total_events      = len(events),
         total_alerts      = len(alerts),
-        processing_time_s = data.get("total_time_s", 0),
-        gpu               = data.get("gpu", "A10G"),
+        processing_time_s = data.get("processing_time_s", data.get("total_time_s", 0)),
+        gpu               = data.get("gpu", "A100-80GB"),
+        chunks            = data.get("chunks", 0),
+        subclips          = data.get("subclips", 0),
+        cpu_time_s        = data.get("cpu_time_s", 0.0),
+        gpu_time_s        = data.get("gpu_time_s", 0.0),
     )
     n_inserted = insert_events(video_id, events)
-    print(f"     ✅ {n_inserted} events inserted into SQLite")
+    print(f"  SQLite: {n_inserted} events inserted")
 
-    # ── 2. Actian VectorAI ─────────────────────────────────────────────────────
-    print("  🔍  Actian VectorAI...")
+    # ── 2. VectorAI ───────────────────────────────────────────────────────────
     try:
+        from services.vectordb import ensure_collection, ingest_events
         ensure_collection()
         n_vectors = ingest_events(events)
-        print(f"     ✅ {n_vectors} embeddings inserted into VectorAI")
+        print(f"  VectorAI: {n_vectors} embeddings inserted")
     except Exception as e:
-        print(f"     ⚠️  VectorAI insert failed: {e}")
-        print(f"        Make sure Docker is running: docker compose up -d")
+        print(f"  VectorAI: skipped ({e})")
 
-    print(f"\n✅ Ingest complete — {len(events)} events, {len(alerts)} alerts")
-    print(f"   SQLite: vigilant.db")
-    print(f"   VectorAI collection: vigilant_events")
+    # ── 3. Gemini Synthesis ───────────────────────────────────────────────────
+    try:
+        from services.gemini_synthesis import synthesize_video
+        print("  Gemini: synthesizing video summary...")
+        synthesis = synthesize_video(events, video_name)
+        save_video_summary(video_id, synthesis)
+        print(f"  Gemini: summary saved (intent={synthesis.get('intent', [])}, risk={synthesis.get('risk_level', '?')})")
+    except Exception as e:
+        print(f"  Gemini: synthesis failed ({e})")
+
+    # ── 4. Cleanup ────────────────────────────────────────────────────────────
+    if delete_json:
+        try:
+            os.remove(path)
+            print(f"  Cleanup: deleted {path.name}")
+        except Exception:
+            pass
+
+    print(f"Ingest complete: {len(events)} events, {len(alerts)} alerts")
 
 
 if __name__ == "__main__":
