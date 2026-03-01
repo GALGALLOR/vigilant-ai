@@ -24,8 +24,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, AsyncIterator
 
+from config import get_env, load_env_file
+
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
+
+load_env_file()
+
+ALLOWED_ORIGINS = [o.strip() for o in (get_env("CORS_ALLOWED_ORIGINS", "*") or "*").split(",") if o.strip()]
 
 app = FastAPI(
     title="Sentinel-Stream API",
@@ -35,7 +41,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

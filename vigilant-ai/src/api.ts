@@ -1,4 +1,21 @@
-const API_BASE = '/api';
+const rawApiBase = import.meta.env.VITE_API_BASE_URL?.trim();
+export const API_BASE = rawApiBase ? rawApiBase.replace(/\/$/, '') : '/api';
+
+function apiUrl(path: string) {
+  return `${API_BASE}${path}`;
+}
+
+export function wsUrl(path: string) {
+  const rawWsBase = import.meta.env.VITE_WS_BASE_URL?.trim();
+  if (rawWsBase) {
+    return `${rawWsBase.replace(/\/$/, '')}${path}`;
+  }
+  if (typeof window === 'undefined') {
+    return path;
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}${path}`;
+}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -100,7 +117,7 @@ export function ev(e: EventData) {
 // ─── Fetch helper ────────────────────────────────────────────────────────────
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(apiUrl(path), {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
@@ -154,9 +171,23 @@ export const api = {
         else reject(new Error(`Upload failed: ${xhr.status}`));
       });
       xhr.addEventListener('error', () => reject(new Error('Upload failed')));
-      xhr.open('POST', `${API_BASE}/upload`);
+      xhr.open('POST', apiUrl('/upload'));
       xhr.send(form);
     });
+  },
+
+  uploadClip: async (file: Blob, filename = 'live-capture.webm') => {
+    const form = new FormData();
+    form.append('file', file, filename);
+    const res = await fetch(apiUrl('/upload-clip'), {
+      method: 'POST',
+      body: form,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`API ${res.status}: ${body || res.statusText}`);
+    }
+    return res.json() as Promise<{ status: string; path: string }>;
   },
 
   uploadStatus: (videoId: string) =>
@@ -178,7 +209,7 @@ export const api = {
     const stream = new ReadableStream<string>({
       start(c) { controller = c; },
     });
-    fetch(`${API_BASE}/chat/stream`, {
+    fetch(apiUrl('/chat/stream'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, video_id: videoId, top_k: topK }),

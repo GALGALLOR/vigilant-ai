@@ -71,3 +71,14 @@ export default defineConfig([
   },
 ])
 ```
+
+## Frontend API configuration
+
+When deploying the frontend on a separate domain, configure explicit backend URLs:
+
+```bash
+VITE_API_BASE_URL=https://your-backend-domain.com/api
+VITE_WS_BASE_URL=wss://your-backend-domain.com
+```
+
+If these are not set, the app defaults to same-origin (`/api`) and websocket origin auto-detection (`ws(s)://<current-host>/ws/stream`).
