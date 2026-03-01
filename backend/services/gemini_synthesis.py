@@ -11,11 +11,13 @@ Uses Gemini 2.5 Flash (free tier: 30 RPM, 1M tokens/day).
 """
 
 from __future__ import annotations
-import os, json, asyncio, threading
+import json, asyncio, threading
 from typing import List, Dict, Any, Optional, AsyncIterator
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyABZMPfjVnsPu3aYpnuFqhORorteVao6wo")
-MODEL_ID = "gemini-2.5-flash"
+from config import get_env
+
+GEMINI_API_KEY = get_env("GEMINI_API_KEY", required=True)
+MODEL_ID = get_env("GEMINI_MODEL_ID", "gemini-2.5-flash")
 
 # ─── Gemini Client ────────────────────────────────────────────────────────────
 

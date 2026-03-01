@@ -56,8 +56,8 @@ ALERT_C_THRESHOLD = 0.70
 YOLO_CONF         = 0.25           # lower = catch more subtle detections
 YOLO_MODEL        = "yolo11l.pt"
 CLIP_MODEL_ID     = "openai/clip-vit-large-patch14"
-GEMINI_MODEL_ID   = "gemini-2.0-flash"             # vision API — no censorship, fast
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "AIzaSyAtNHeU3gdfFrQyz2aTwxJ8HrOX6oNyTpg")
+GEMINI_MODEL_ID   = os.environ.get("GEMINI_MODEL_ID", "gemini-2.0-flash")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 MODEL_CACHE_DIR   = "/models"      # path inside Modal Volume
 
 VIDEO_URL = "shoplifting2.mp4"
@@ -626,6 +626,9 @@ class FeatureExtractor:
         import io, json
         from google import genai
         from google.genai import types
+
+        if not GEMINI_API_KEY:
+            return {"description": "Missing GEMINI_API_KEY", "is_fighting": False, "is_stealing": False, "is_erratic": False}
 
         client = genai.Client(api_key=GEMINI_API_KEY)
 

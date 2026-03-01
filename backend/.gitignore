@@ -45,3 +45,5 @@ santosh_events.json
 # OS
 .DS_Store
 Thumbs.db
+# Local secrets
+.env
