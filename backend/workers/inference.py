@@ -57,7 +57,7 @@ YOLO_CONF         = 0.25           # lower = catch more subtle detections
 YOLO_MODEL        = "yolo11l.pt"
 CLIP_MODEL_ID     = "openai/clip-vit-large-patch14"
 GEMINI_MODEL_ID   = "gemini-2.0-flash"             # vision API — no censorship, fast
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "AIzaSyABZMPfjVnsPu3aYpnuFqhORorteVao6wo")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "AIzaSyAtNHeU3gdfFrQyz2aTwxJ8HrOX6oNyTpg")
 MODEL_CACHE_DIR   = "/models"      # path inside Modal Volume
 
 VIDEO_URL = "shoplifting2.mp4"
@@ -867,3 +867,28 @@ def get_video_duration(video_name: str) -> float:
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     return frames / fps
+
+
+# ─── Lightweight local analyzer for development/testing ───────────────────
+def analyze_clip(path: str) -> None:
+    """Simple local analyzer: prints detected incidents (placeholder).
+
+    Replace this function with a real model inference call or a Modal task
+    if you want heavier processing. This implementation is synchronous and
+    safe to call from background threads.
+    """
+    try:
+        print(f"[inference] analyzing clip: {path}")
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        incidents = []
+        # Placeholder heuristic: if the clip is larger than ~20KB, flag stealing
+        if size > 20_000:
+            incidents.append({"label": "stealing", "confidence": 0.85})
+
+        if incidents:
+            for inc in incidents:
+                print(f"[incident] {inc['label']} confidence={inc['confidence']}")
+        else:
+            print("[inference] no incidents detected")
+    except Exception as e:
+        print(f"[inference] error analyzing clip: {e}")

@@ -14,6 +14,9 @@ import json
 import sys
 import os
 from pathlib import Path
+import tempfile
+import threading
+from typing import Dict, List
 
 
 def _strip_private(event: dict) -> dict:
@@ -100,3 +103,56 @@ def ingest_results(events_json_path: str, delete_json: bool = False) -> None:
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else "results/events.json"
     ingest_results(path)
+
+
+# ─── Streamed ingest helper ──────────────────────────────────────────────────
+# Buffers short binary chunks (from WebSocket MediaRecorder) per client and
+# writes a clip file once enough chunks are accumulated, then calls
+# `workers.inference.analyze_clip` in a background thread.
+_client_buffers: Dict[str, List[bytes]] = {}
+CHUNKS_PER_CLIP = 1  # number of MediaRecorder blobs to assemble per clip
+
+
+async def ingest_frame(client_id: str, chunk_bytes: bytes) -> None:
+    """Called by the WebSocket handler. Buffers chunks and spawns a background
+    thread to analyze an assembled clip once the threshold is reached.
+    """
+    buf = _client_buffers.setdefault(client_id, [])
+    buf.append(chunk_bytes)
+    if len(buf) < CHUNKS_PER_CLIP:
+        return
+
+    # assemble clip on disk
+    uploads_dir = Path(__file__).parent.parent / "uploads"
+    uploads_dir.mkdir(exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=".webm", dir=str(uploads_dir))
+    os.close(fd)
+    try:
+        with open(tmp_path, "wb") as f:
+            for b in buf:
+                f.write(b)
+    except Exception as e:
+        print(f"[ingest] failed to write clip: {e}")
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        _client_buffers[client_id] = []
+        return
+
+    # reset buffer
+    _client_buffers[client_id] = []
+
+    def _analyze(path: str):
+        try:
+            from workers import inference
+            inference.analyze_clip(path)
+        except Exception as e:
+            print(f"[ingest] analysis failed: {e}")
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    threading.Thread(target=_analyze, args=(tmp_path,), daemon=True).start()

@@ -18,7 +18,7 @@ Run locally:
 from __future__ import annotations
 import os, json, time, math, traceback
 from pathlib import Path
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -82,6 +82,62 @@ def startup():
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "sentinel-stream"}
+
+
+# ─── Live stream (WebSocket) ─────────────────────────────────────────────────
+@app.websocket("/ws/stream")
+async def stream_ws(websocket: WebSocket):
+    """Accepts binary WebM chunks from a browser MediaRecorder and forwards to ingest.
+    Each received binary blob is passed to `services.ingest.ingest_frame` for buffering
+    and later analysis.
+    """
+    await websocket.accept()
+    client_id = str(id(websocket))
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            # Forward to ingest pipeline (async function)
+            try:
+                from services import ingest
+                await ingest.ingest_frame(client_id, data)
+            except Exception as e:
+                print(f"[ws] ingest error: {e}")
+    except WebSocketDisconnect:
+        print(f"[ws] client disconnected: {client_id}")
+    except Exception as e:
+        print(f"[ws] unexpected error: {e}")
+
+
+@app.post("/api/upload-clip")
+async def upload_clip(file: UploadFile = File(...)):
+    """Accept a single short video clip (webm/mp4) and run local analysis in background."""
+    if not file.filename:
+        raise HTTPException(400, "No file provided")
+
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    out_path = UPLOAD_DIR / file.filename
+    # stream to disk
+    with open(out_path, "wb") as f:
+        while True:
+            chunk = await file.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    # background analyze
+    import threading
+    def _run(path: str):
+        try:
+            from workers import inference
+            inference.analyze_clip(path)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, args=(str(out_path),), daemon=True).start()
+    return {"status": "queued", "path": str(out_path)}
 
 
 # ─── Upload Pipeline ─────────────────────────────────────────────────────────
